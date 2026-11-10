@@ -1,11 +1,10 @@
-# Не забудьте добавить .gitignore если будете использовать Git
-
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
@@ -19,12 +18,10 @@ ENV/
 # Jupyter Notebook
 .ipynb_checkpoints/
 
-# Data files (если не хотите коммитить большие файлы)
+# Datasets & cached artifacts
 data/train.csv
 data/test.csv
 data/submission.csv
-
-# Results (submission создается автоматически)
 results/submission.csv
 results/
 models/
@@ -33,9 +30,7 @@ cache/
 catboost_info
 checkpoints
 
-# Docker
+# Docker & OS
 *.tar
-
-# OS
 .DS_Store
 Thumbs.db
