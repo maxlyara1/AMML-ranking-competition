@@ -1,164 +1,91 @@
-# 🎯 AMML ranking competition
+# E-Commerce Search Learning-to-Rank Pipeline (`CatBoost YetiRank` + Cross-Encoder Reranking)
 
-> Решение задачи ранжирования товаров по поисковым запросам с использованием градиентного бустинга и cross-encoder моделей
-
----
-
-## 📋 О проекте
-
-**Вход:** Поисковый запрос + карточка товара  
-**Таргет:** Релевантность `relevance` ∈ {0, 1, 2, 3}  
-**Метрика:** nDCG@10 (по группам `query_id`)
-
-### 📊 Данные
-- `train.csv` — ~49k строк с таргетом
-- `test.csv` — ~21k строк без таргета
-- `submission.csv` — формат сабмита (id/prediction)
+Two-stage product search ranking pipeline optimizing **`nDCG@10`** across query groups (`~49k` labeled training pairs, `~21k` test pairs, relevance grades `{0, 1, 2, 3}`), combining `GroupKFold` **`CatBoost` (`YetiRank`)** over lexical, dense-embedding, and cached cross-encoder features with optional fine-tuned **`MiniLM`** top-K reranking.
 
 ---
 
-## 🏗️ Архитектура решения
+## 1. Pipeline Architecture
 
-```
-┌─────────────────┐
-│   Raw Data      │
-│  (train/test)   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Preprocessing  │ ◄─── HTML очистка, нормализация, обрезка
-│  (clean_text)   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│    Features     │ ◄─── BM25, E5 embeddings, CE scores, TE
-│  Engineering    │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│   CatBoost      │ ◄─── GroupKFold, YetiRank loss
-│   Ensemble      │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│   CE Blend      │ ◄─── Смешивание CatBoost + CE scores из фичей
-│  (ce_blend_w)   │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  CE Rerank      │ ◄─── Fine-tuned MiniLM (опционально)
-│  (top-K)        │
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  Submission     │
-└─────────────────┘
+```text
+Raw Query + Product Catalog (title, description, bullet_point, brand, color)
+   |
+   +--> Text Normalization (`src/preprocessing.py`: HTML stripping, ftfy, +/-160 char query-centric windowing)
+   |
+   +--> Multi-Signal Feature Engineering (`src/features.py`, disk-cached in `cache/`)
+   |       |-- Lexical: BM25 (title / description / bullets / full), Jaccard, Levenshtein, RapidFuzz, numeric overlap
+   |       |-- Dense Bi-Encoder: `intfloat/multilingual-e5-large-instruct` cosine similarities across fields
+   |       |-- Cross-Encoder Feature: cached `BAAI/bge-reranker-v2-m3` query-document relevance logits
+   |       '-- Out-of-Fold Target Encoding (`product_id`, `product_title`, `query`) + categorical brand/color
+   |
+   +--> Stage 1 Ranker (`src/train.py`): GroupKFold (`query_id`) CatBoost `YetiRank` Ensemble
+   |
+   '--> Stage 2 Blending & Optional Top-K Reranking (`src/ce_train.py`, `src/rerank.py`, `src/inference.py`)
+           '-- Score fusion with cached CE features + fine-tuned `MiniLM` cross-encoder over top-K candidates
 ```
 
 ---
 
-## 🔧 Компоненты пайплайна
+## 2. Core Modules
 
-### 1️⃣ **Препроцессинг** (`src/preprocessing.py`)
-- 🧹 Очистка HTML-тегов и entities (`clean_text`)
-- ✂️ Удаление пунктуации/цифр в начале запросов
-- 🔄 Нормализация плейсхолдеров (`none`/`[null]`/`brand_masked` → `""`)
-- 📏 Релевантное окно ±160 символов для длинных полей
-- 🎨 Нормализация брендов и цветов
-- 🗑️ Удаление константных признаков (`product_locale`)
-
-### 2️⃣ **Feature Engineering** (`src/features.py`)
-- **Текстовые метрики:**
-  - BM25 по title/description/bullet_point/all
-  - Jaccard similarity, Levenshtein distance
-  - Coverage, числовые совпадения
-  
-- **Семантические фичи:**
-  - E5 embeddings (`intfloat/multilingual-e5-large-instruct`)
-  - Cosine similarity для title/desc/bullet/all
-  - Комбинированные фичи: title+brand+color
-  
-- **Cross-encoder:**
-  - BGE-reranker-v2-m3 скоры (кешируются)
-  
-- **Target Encoding:**
-  - TE для `product_id`, `product_title`, `query`
-  
-- **Категориальные:**
-  - Подготовка для CatBoost (brand, color)
-
-### 3️⃣ **Обучение CatBoost** (`src/train.py`)
-- 📊 GroupKFold по `query_id` (seed: 993)
-- 🎯 Loss: YetiRank (оптимизирован для ранжирования)
-- 💾 Сохранение: фолды `catboost_fold*.cbm` + `metadata.json`
-
-### 4️⃣ **Инференс** (`src/inference.py`)
-- 🔄 Препроцессинг + фичи
-- 🤖 CatBoost ансамбль
-- 🔀 Опциональный CE blend (`ce_blend_weight`)
-- 🔝 CE rerank top-K (fine-tuned MiniLM)
-
-### 5️⃣ **Cross-Encoder Training** (`src/ce_train.py`)
-- 🎓 Fine-tuning MiniLM (2 эпохи, max_len=160)
-- 📦 Сохранение в `models_ce_minilm/`
+- **`src/preprocessing.py`**: Cleans broken HTML/entities (`BeautifulSoup`, `ftfy`), normalizes masked/null brand and color tokens, drops constant columns (`product_locale`), and extracts `+/-160`-character context windows centered on query matches inside long product descriptions.
+- **`src/features.py`**: Computes multi-field `BM25`, token coverage, edit-distance ratios (`Levenshtein`, `RapidFuzz`), `intfloat/multilingual-e5-large-instruct` dense field similarities, cached `BAAI/bge-reranker-v2-m3` cross-encoder scores, and leakage-free out-of-fold target encodings.
+- **`src/train.py`**: Trains a `GroupKFold` (`query_id`, `seed = 993`) `CatBoost` ensemble under the listwise/pairwise `YetiRank` objective (`catboost_fold*.cbm` + `metadata.json`).
+- **`src/ce_train.py` & `src/rerank.py`**: Fine-tunes a lightweight `MiniLM` cross-encoder (`max_len = 160`) on query-product pairs and reranks the top-`K` candidates produced by Stage 1.
+- **`src/inference.py` & `main.py`**: Unified CLI supporting standalone training, cross-encoder fine-tuning, score blending (`--ce-blend-weight`), top-K reranking (`--ce-rerank-top-k`), and full end-to-end submission generation.
 
 ---
 
-## 🚀 Быстрый старт
+## 3. Repository Structure
 
-### Установка
+```text
+AMML-ranking-competition/
+|-- main.py                     # CLI entrypoint (train / ce-train / infer / rerank / full)
+|-- src/
+|   |-- preprocessing.py        # HTML stripping, normalization & query-window extraction
+|   |-- features.py             # BM25, E5 dense, BGE-reranker-v2-m3 & OOF target encoding
+|   |-- train.py                # GroupKFold CatBoost YetiRank training
+|   |-- ce_train.py             # Cross-encoder fine-tuning
+|   |-- rerank.py               # Top-K cross-encoder score fusion
+|   '-- inference.py            # Ensemble prediction & submission writer
+|-- notebooks/eda.ipynb         # Corpus & query-group exploratory analysis
+|-- Dockerfile                  # Containerized reproducible run
+'-- requirements.txt            # Pinned dependencies
+```
+
+---
+
+## 4. Reproducible Usage
+
+### Setup
+
 ```bash
-python -m venv .venv
-source .venv/bin/activate  # Linux/Mac
-# или
-.venv\Scripts\activate     # Windows
+git clone https://github.com/maxlyara1/AMML-ranking-competition.git
+cd AMML-ranking-competition
 
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Запуск полного цикла
+### End-to-End Training & Inference (`main.py`)
+
 ```bash
+# Full pipeline (CatBoost YetiRank + optional CE stage + test inference):
 python main.py --mode full \
   --train-path data/train.csv \
   --test-path data/test.csv \
   --models-dir models \
   --submission-path results/submission.csv
-```
 
-> 💡 **Совет:** Фичи и CE-скоры кэшируются в `cache/` для ускорения повторных запусков
-
----
-
-## 🎮 Режимы работы `main.py`
-
-| Режим | Описание |
-|-------|----------|
-| `train` | Обучение CatBoost на train.csv |
-| `infer` | Инференс на test.csv → submission.csv |
-| `ce-train` | Fine-tuning Cross-Encoder MiniLM |
-| `full` | Полный цикл: train → ce-train (если нужно) → infer |
-| `rerank` | Применение CE rerank к готовому submission.csv |
-
-### Примеры команд
-
-**Обучение CatBoost:**
-```bash
+# Stage-1 CatBoost YetiRank training with explicit hyperparameters:
 python main.py --mode train \
   --train-path data/train.csv \
   --models-dir models \
   --iterations 2000 \
   --learning-rate 0.03 \
   --depth 8
-```
 
-**Инференс с CE rerank:**
-```bash
+# Inference with top-K cross-encoder reranking:
 python main.py --mode infer \
   --test-path data/test.csv \
   --models-dir models \
@@ -168,80 +95,12 @@ python main.py --mode infer \
   --ce-rerank-weight 0.4
 ```
 
----
-
-## 🐳 Docker
-
-Сборка и запуск инференса:
+### Docker
 
 ```bash
-# Сборка образа
-docker build -t maksim-lyara-solution .
-
-# Запуск (data/ должен быть примонтирован)
+docker build -t ltr-search-ranking .
 docker run --rm \
-  -v $(pwd)/data:/app/data \
-  -v $(pwd)/results:/app/results \
-  maksim-lyara-solution
+  -v "$(pwd)/data:/app/data" \
+  -v "$(pwd)/results:/app/results" \
+  ltr-search-ranking
 ```
-
-Итоговый файл: `results/submission.csv`
-
----
-
-## 📁 Структура проекта
-
-```
-.
-├── src/                     # Основной код
-│   ├── preprocessing.py     # Очистка и нормализация данных
-│   ├── features.py          # Генерация признаков
-│   ├── train.py             # Обучение CatBoost
-│   ├── inference.py         # Инференс
-│   ├── ce_train.py          # Обучение Cross-Encoder
-│   └── rerank.py            # CE rerank
-│
-├── data/                     # Данные
-│   ├── train.csv
-│   └── test.csv
-│
-├── models/                   # CatBoost модели
-│   ├── catboost_fold*.cbm
-│   └── metadata.json
-│
-├── models_ce_minilm/         # Fine-tuned CE
-│
-├── cache/                    # Кэш эмбеддингов и CE скоров
-│
-├── notebooks/                # EDA и эксперименты
-│   └── eda.ipynb
-│
-├── results/                  # Результаты
-│   └── submission.csv
-│
-├── main.py                   # Точка входа
-└── requirements.txt          # Зависимости
-```
-
----
-
-## 💡 Ключевые особенности
-
-- ✅ **Фиксированный seed (993)** для воспроизводимости
-- ✅ **Нормализация train/test** для устранения data leakage
-- ✅ **Умная обрезка текста** — релевантное окно ускоряет обработку
-- ✅ **Кэширование** — эмбеддинги и CE скоры переиспользуются
-- ✅ **Гибкий блендинг** — настраиваемые веса для CatBoost + CE
-- ✅ **Production-ready** — Docker-контейнер для деплоя
-
----
-
-## 📚 Дополнительная информация
-
-Подробный EDA и обоснование выбора препроцессинга: `notebooks/eda.ipynb`
-
----
-
-## 👤 Автор
-
-**Maksim Lyara** — решение для AMML ranking competition
